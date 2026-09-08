@@ -1,0 +1,17 @@
+[package]
+name = "garnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mini Garnet: a RESP cache-store built on the RUMDS interface of mini Tsavorite"
+
+[lib]
+name = "garnet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mini-garnet"
+path = "src/main.rs"
+
+[dependencies]
+tsavorite = { path = "../tsavorite" }

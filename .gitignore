@@ -1,0 +1,4 @@
+target/
+*.aof
+*.ckpt
+/data/
