@@ -455,6 +455,16 @@ impl SessionFunctions for StringFunctions {
         }
         match input.op {
             StringOp::SetNx => CopyDecision::Cancel, // exists -> don't overwrite
+            // The same guard `in_place_updater` applies, at the copy boundary.
+            // Without it INCR would answer differently depending on which log
+            // region the record has drifted into, and `copy_updater` would
+            // silently reset a non-integer value to the delta.
+            StringOp::IncrBy => {
+                match parse_i64(old.value()).and_then(|cur| cur.checked_add(input.delta)) {
+                    Some(_) => CopyDecision::Copy,
+                    None => CopyDecision::Cancel,
+                }
+            }
             StringOp::GetDel => {
                 // Return the old value and tombstone it in the same pass.
                 out.set_bytes(old.value());

@@ -310,6 +310,134 @@ fn large_dataset_spills_to_disk() {
     assert_eq!(c.cmd(&["GET", "key0"]).as_str(), "value-number-0!");
 }
 
+/// A record drifts down the log as unrelated traffic arrives: mutable tail →
+/// immutable in memory → disk. INCR owes the same answer in all three, so the
+/// non-integer and overflow guards cannot live only in `in_place_updater` —
+/// the copy paths need them too, or the reply (and the stored value) would
+/// depend on how much traffic has passed since the key was written.
+#[test]
+fn incr_guards_hold_in_every_log_region() {
+    fn reply(s: &mut garnet::commands::RespSession, parts: &[&[u8]]) -> Reply {
+        common::parse_reply(&s.run(parts))
+    }
+
+    /// The answers INCR owes for one region's key set.
+    fn assert_answers(s: &mut garnet::commands::RespSession, suffix: &str, region: &str) {
+        let (word, num, big) = (
+            format!("word{suffix}"),
+            format!("num{suffix}"),
+            format!("big{suffix}"),
+        );
+        assert!(
+            matches!(reply(s, &[b"INCR", word.as_bytes()]), Reply::Error(_)),
+            "INCR on a non-integer must fail ({region})"
+        );
+        assert_eq!(
+            reply(s, &[b"GET", word.as_bytes()]).as_str(),
+            "abc",
+            "a rejected INCR must leave the value alone ({region})"
+        );
+        assert!(
+            matches!(reply(s, &[b"INCR", big.as_bytes()]), Reply::Error(_)),
+            "INCR past i64::MAX must fail ({region})"
+        );
+        assert_eq!(
+            reply(s, &[b"GET", big.as_bytes()]).as_str(),
+            "9223372036854775807",
+            "a rejected INCR must leave the value alone ({region})"
+        );
+        assert_eq!(
+            reply(s, &[b"INCR", num.as_bytes()]),
+            Reply::Int(42),
+            "a valid INCR must still work ({region})"
+        );
+    }
+
+    fn address_of(shared: &garnet::shared::Shared, key: &[u8]) -> u64 {
+        shared
+            .store
+            .index
+            .find_tag(tsavorite::hash::hash64(key))
+            .expect("key is indexed")
+            .load()
+            .address()
+    }
+
+    /// Append unrelated keys until a watermark has moved past the record.
+    fn fill_until(
+        s: &mut garnet::commands::RespSession,
+        tag: &str,
+        mut done: impl FnMut() -> bool,
+    ) {
+        for i in 0..200_000u32 {
+            if done() {
+                return;
+            }
+            let k = format!("filler-{tag}-{i}");
+            s.run(&[b"SET", k.as_bytes(), b"0123456789abcdef"]);
+        }
+        panic!("watermark never advanced past the record");
+    }
+
+    let cfg = garnet::shared::Config {
+        bind: "127.0.0.1:0".into(),
+        dir: std::env::temp_dir().join("mini-garnet-incr-regions"),
+        persist: false,
+        aof: false,
+        aof_commit_wait: false,
+        commit_mode: garnet::aof::CommitMode::Never,
+        // Small pages, so a few hundred filler writes move the watermarks.
+        store: tsavorite::store::StoreSettings {
+            index_buckets: 1 << 12,
+            log: tsavorite::log::LogSettings {
+                page_bits: 12,
+                memory_pages: 8,
+                mutable_fraction: 0.5,
+            },
+        },
+    };
+    let shared = garnet::shared::Shared::new(cfg).unwrap();
+    let mut s = garnet::commands::RespSession::new(shared.clone());
+
+    // One key set per region, all written up front so each set stays together.
+    for suffix in ["", "-ro", "-disk"] {
+        s.run(&[b"SET", format!("word{suffix}").as_bytes(), b"abc"]);
+        s.run(&[b"SET", format!("num{suffix}").as_bytes(), b"41"]);
+        s.run(&[
+            b"SET",
+            format!("big{suffix}").as_bytes(),
+            b"9223372036854775807",
+        ]);
+    }
+
+    // 1. Mutable tail: `in_place_updater` decides.
+    assert_answers(&mut s, "", "mutable");
+
+    // 2. Below ReadOnly: the record is immutable, so RMW copies to the tail
+    //    and `need_copy_update` decides.
+    let ro_target = ["word-ro", "num-ro", "big-ro"]
+        .iter()
+        .map(|k| address_of(&shared, k.as_bytes()))
+        .max()
+        .unwrap();
+    fill_until(&mut s, "ro", || {
+        shared.store.log.read_only_address() > ro_target
+    });
+    assert_answers(&mut s, "-ro", "immutable");
+
+    // 3. Below Head: the record has been evicted, so RMW reads it back from
+    //    the device and copy-updates from the disk image.
+    let disk_target = ["word-disk", "num-disk", "big-disk"]
+        .iter()
+        .map(|k| address_of(&shared, k.as_bytes()))
+        .max()
+        .unwrap();
+    fill_until(&mut s, "disk", || {
+        shared.store.log.head_address() > disk_target
+    });
+    assert_answers(&mut s, "-disk", "on disk");
+}
+
 #[test]
 fn aof_recovers_state_after_restart() {
     let dir = std::env::temp_dir().join(format!(
