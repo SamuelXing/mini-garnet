@@ -21,6 +21,13 @@ It deliberately leaves out cluster mode, the object store, the read cache,
 revivification, kernel-bypass networking, TLS, Lua, and most of the 250+ command
 surface. Those are large and orthogonal to the core.
 
+One simplification shows up at runtime rather than in that list. This server runs
+one OS thread per connection, and every thread that touches the store owns a slot
+in a fixed-size epoch table, so concurrent connections are capped — `--maxclients`,
+default 120. Past the cap it replies `-ERR max number of clients reached` and
+closes, as Redis does. Real Garnet sizes threads by cores and connections by
+memory; thread-per-connection is this model's shortcut, not Garnet's design.
+
 ```sh
 cargo run --release -- --port 6399 --persist --aof
 redis-cli -p 6399 set hello world
@@ -33,6 +40,9 @@ redis-cli -p 6399 incr counter
   like this. Why a hash index over a log, why the tail is mutable, why there are
   two read-only watermarks, why five operations and not fifty, and how it compares
   to Redis.
+- [docs/reading-guide.md](docs/reading-guide.md) — the same derivation with the
+  code beside it. What each forced move costs one `INCR counter`, which file and
+  line implements it, and the single race that explains the fuzzy region.
 - [docs/storage-format.md](docs/storage-format.md) — the on-log record layout, the
   hash bucket, and the four regions of the address space.
 
@@ -43,7 +53,7 @@ redis-cli -p 6399 incr counter
 flowchart TB
     CLI["RESP clients (redis-cli, any language)"]
 
-    subgraph SN["shared-nothing — one thread per connection, no shared mutable state"]
+    subgraph SN["shared-nothing sessions — per-connection state, nothing shared between connections"]
         direction LR
         RB["recv buffer<br/>kernel fills it once"]
         PA["RESP parse<br/>args are slices into recv"]
@@ -75,6 +85,14 @@ The boundary in the middle is the design. Everything above it is per-connection
 and shares nothing, so it needs no synchronization. Everything below it is shared
 by every thread, and all the concurrency work is paid there, once. Garnet's phrase
 is "shared-nothing sessions over a shared-everything store".
+
+"Shared-nothing" there is about *session state* — buffers, parse scratch,
+transaction state, the Tsavorite session — and not about the keyspace. The data is
+deliberately **not** partitioned: every thread reaches every record, and cache
+coherence moves the data to the request instead of a router moving the request to
+the data. That choice is the first domino in
+[docs/design-derivation.md](docs/design-derivation.md), and the reason the engine
+needs epochs at all.
 
 ## Storage format
 
