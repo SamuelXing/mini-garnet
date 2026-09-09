@@ -10,6 +10,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::commands::{Action, RespSession};
@@ -18,6 +19,27 @@ use crate::shared::Shared;
 
 const INITIAL_RECV: usize = 64 * 1024;
 const MAX_RECV: usize = 512 * 1024 * 1024;
+
+/// Ceiling on concurrent connections (Redis's `maxclients`).
+///
+/// Not a policy knob but a structural limit. This server runs one thread per
+/// connection, and every thread that touches the store owns a slot in the epoch
+/// table for as long as it lives. That table is a fixed-size array walked on
+/// every reclamation check, so it is sized for cores, not for clients
+/// (`epoch::MAX_THREADS`). Accepting past it would panic a connection thread
+/// deep inside the engine; refusing at the door turns that into an error the
+/// client can read. The headroom covers threads that touch the store without
+/// serving a connection, such as recovery.
+pub const DEFAULT_MAX_CLIENTS: usize = tsavorite::epoch::MAX_THREADS - 8;
+
+/// Releases a connection's slot when its thread ends, however it ends.
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub fn serve(shared: Arc<Shared>) -> std::io::Result<()> {
     let listener = TcpListener::bind(&shared.config.bind)?;
@@ -28,14 +50,23 @@ pub fn serve(shared: Arc<Shared>) -> std::io::Result<()> {
 /// Accept loop on an already-bound listener. Tests use this to bind an
 /// ephemeral port and learn its number before serving.
 pub fn serve_on(listener: TcpListener, shared: Arc<Shared>) -> std::io::Result<()> {
+    let live = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                if live.fetch_add(1, Ordering::AcqRel) >= shared.config.maxclients {
+                    live.fetch_sub(1, Ordering::AcqRel);
+                    // The reply Redis sends, so clients report it the usual way.
+                    let _ = stream.write_all(b"-ERR max number of clients reached\r\n");
+                    continue; // dropping `stream` closes it
+                }
+                let slot = ConnSlot(live.clone());
                 let shared = shared.clone();
                 // One thread per connection. Everything for a batch — parse,
                 // storage ops, reply formatting — happens on this thread, with
                 // no handoff to a worker (paper §3.1).
                 std::thread::spawn(move || {
+                    let _slot = slot;
                     if let Err(e) = handle_connection(stream, shared) {
                         if e.kind() != std::io::ErrorKind::UnexpectedEof {
                             eprintln!("connection error: {e}");

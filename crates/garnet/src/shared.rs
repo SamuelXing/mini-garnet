@@ -54,6 +54,9 @@ pub struct Config {
     pub aof_commit_wait: bool,
     pub commit_mode: CommitMode,
     pub store: StoreSettings,
+    /// Concurrent connection ceiling; see [`crate::server::DEFAULT_MAX_CLIENTS`]
+    /// for why this one is a structural limit rather than a policy knob.
+    pub maxclients: usize,
 }
 
 impl Default for Config {
@@ -66,6 +69,7 @@ impl Default for Config {
             aof_commit_wait: false,
             commit_mode: CommitMode::Interval(100),
             store: StoreSettings::default(),
+            maxclients: crate::server::DEFAULT_MAX_CLIENTS,
         }
     }
 }

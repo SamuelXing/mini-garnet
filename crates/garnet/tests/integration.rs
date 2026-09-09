@@ -26,6 +26,7 @@ fn spawn_server(persist: bool, aof: bool) -> (String, std::path::PathBuf) {
             garnet::aof::CommitMode::Never
         },
         store: garnet::store_settings_small(),
+        maxclients: garnet::server::DEFAULT_MAX_CLIENTS,
     };
     let shared = garnet::shared::Shared::new(cfg).unwrap();
     shared.recover().unwrap();
@@ -52,6 +53,7 @@ fn persist_cfg(dir: &std::path::Path) -> garnet::shared::Config {
         aof_commit_wait: true,
         commit_mode: garnet::aof::CommitMode::Always,
         store: garnet::store_settings_small(),
+        maxclients: garnet::server::DEFAULT_MAX_CLIENTS,
     }
 }
 
@@ -229,6 +231,71 @@ fn pipelining_one_flush() {
     }
 }
 
+/// One thread per connection means a connection costs an epoch-table slot, and
+/// that table has a fixed size. Past the ceiling the server must refuse at the
+/// door with an error the client can read — not accept and then panic a thread
+/// inside the engine. Closing a connection has to give the slot back.
+#[test]
+fn connections_past_maxclients_are_refused_and_the_slot_is_reusable() {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    const LIMIT: usize = 4;
+    const REFUSAL: &[u8] = b"-ERR max number of clients reached\r\n";
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let cfg = garnet::shared::Config {
+        bind: addr.clone(),
+        maxclients: LIMIT,
+        ..garnet::shared::Config::default()
+    };
+    let shared = garnet::shared::Shared::new(cfg).unwrap();
+    std::thread::spawn(move || garnet::server::serve_on(listener, shared).unwrap());
+
+    // A refused connection is told so immediately and then closed; an accepted
+    // one stays silent until it is asked something, so a short read separates
+    // the two without writing to a socket the server may already have dropped.
+    let probe_is_refused = |s: &TcpStream| {
+        s.set_read_timeout(Some(std::time::Duration::from_millis(250)))
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let mut r = s; // `&TcpStream` reads without needing ownership
+        let n = r.read(&mut buf).unwrap_or(0);
+        assert!(n == 0 || buf[..n] == *REFUSAL, "unexpected banner");
+        n > 0
+    };
+
+    // Fill every slot. A completed round trip proves the server has accepted
+    // and counted the connection, so the next connect races nothing.
+    let mut held: Vec<Client> = (0..LIMIT)
+        .map(|_| {
+            let mut c = Client::connect(&addr);
+            assert_eq!(c.cmd(&["PING"]), Reply::Simple("PONG".into()));
+            c
+        })
+        .collect();
+
+    let over = TcpStream::connect(&addr).unwrap();
+    assert!(probe_is_refused(&over), "connection past maxclients");
+
+    // Closing one frees its slot. The server thread has to notice EOF first.
+    held.pop();
+    let mut readmitted = None;
+    for _ in 0..100 {
+        let s = TcpStream::connect(&addr).unwrap();
+        if !probe_is_refused(&s) {
+            readmitted = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        readmitted.is_some(),
+        "a closed connection must give its slot back"
+    );
+}
+
 #[test]
 fn keys_and_dbsize() {
     let (addr, _dir) = spawn_server(false, false);
@@ -395,6 +462,7 @@ fn incr_guards_hold_in_every_log_region() {
                 mutable_fraction: 0.5,
             },
         },
+        maxclients: garnet::server::DEFAULT_MAX_CLIENTS,
     };
     let shared = garnet::shared::Shared::new(cfg).unwrap();
     let mut s = garnet::commands::RespSession::new(shared.clone());

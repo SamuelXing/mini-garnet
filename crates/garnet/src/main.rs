@@ -27,6 +27,11 @@ fn parse_args() -> Config {
                     cfg.dir = d.into();
                 }
             }
+            "--maxclients" => {
+                if let Some(n) = it.next().and_then(|n| n.parse().ok()) {
+                    cfg.maxclients = n;
+                }
+            }
             "--persist" => cfg.persist = true,
             "--aof" => cfg.aof = true,
             "--aof-commit-wait" => {
@@ -35,7 +40,7 @@ fn parse_args() -> Config {
                 cfg.commit_mode = CommitMode::Always;
             }
             "--help" | "-h" => {
-                eprintln!("mini-garnet [--port N] [--bind ADDR] [--dir PATH] [--persist] [--aof] [--aof-commit-wait]");
+                eprintln!("mini-garnet [--port N] [--bind ADDR] [--dir PATH] [--maxclients N] [--persist] [--aof] [--aof-commit-wait]");
                 std::process::exit(0);
             }
             other => eprintln!("ignoring unknown flag: {other}"),
